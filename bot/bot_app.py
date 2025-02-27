@@ -69,9 +69,9 @@ class AppHandler:
         body: Dict[str, Any],
         view: Dict[str, Any],
         say: Callable,
-        callback_id: str,
     ) -> None:
         await ack()
+        callback_id = view["callback_id"]
         form_data = SlackValuesParser.parse_values(view["state"]["values"])
         await run_workflow(
             tasks=self._views_submissions[callback_id],
@@ -82,76 +82,87 @@ class AppHandler:
             },
         )
 
-    async def proxy_action(self, ack, body, client) -> None:
+    async def proxy_action(self, ack: Callable, body: Dict[str, Any], client) -> None:
         await ack()
+        message_ts = body["message"]["ts"]
+        values = body["state"]["values"]
         action_id = body["actions"][0]["action_id"]
 
     def register_view_submission(
         self, template_name: str, callback_id: str, steps: List[Dict]
     ) -> None:
         modified_callback_id = f"{template_name}_{callback_id}"
-        if callback_id not in self._views_submissions:
-
-            async def view_submission(self, ack, body, view, say):
-                await self.proxy_view_submission(
-                    ack, body, view, say, modified_callback_id
-                )
-
-            app.view(modified_callback_id)(view_submission)
+        if modified_callback_id not in self._views_submissions:
+            app.view(modified_callback_id)(self.proxy_view_submission)
         else:
             logger.warning(f"Callback ID {callback_id} already exists. Overwriting.")
-        self._views_submissions[callback_id] = steps
+        self._views_submissions[modified_callback_id] = steps
 
-    def register_action(self, action_id: str, steps: List[Dict]) -> None:
-        # TODO: check if action_id registered for another template
-        if action_id not in self._actions:
-            app.action(action_id)(self.proxy_action)
+    def register_action(
+        self, template_name: str, action_id: str, steps: List[Dict]
+    ) -> None:
+        # modified_action_id = f"{template_name}_{action_id}"
+        modified_action_id = action_id  # TODO: Link action_id to template_name
+        if modified_action_id not in self._actions:
+            app.action(modified_action_id)(self.proxy_action)
         else:
             logger.warning(f"Action ID {action_id} already exists. Overwriting")
-        self._actions[action_id] = steps
+        self._actions[modified_action_id] = steps
 
-    async def register_template(self, template: Dict[str, Any]) -> None: ...
+    def register_workflow_handlers(
+        self, template_name: str, template: Dict[str, Any]
+    ) -> None:
+        # Registering actions described in the template
+        for action in template["spec"].get("actions", []):
+            action_id = action["id"]
+            steps = action["steps"]
+            self.register_action(template_name, action_id, steps)
+
+        # Registering view submissions described in the template
+        for view_submission in template["spec"].get("view_submissions", []):
+            callback_id = view_submission["id"]
+            steps = view_submission["steps"]
+            self.register_view_submission(template_name, callback_id, steps)
+
+    def register_screens_handlers(
+        self, template_name: str, template: Dict[str, Any]
+    ) -> None:
+        # Method that is overridden in subclasses to register handlers
+        # responsible for handling "display" events of messages and modals
+        pass
+
+    def register_template(self, template: Dict[str, Any]) -> None:
+        template_name = template["metadata"]["name"]
+        self._templates[template_name] = template
+
+        self.register_workflow_handlers(template_name, template)
+        self.register_screens_handlers(template_name, template)
 
 
 class ShortcutHandler(AppHandler):
+    def __init__(self, renderer: TemplateRenderer = TemplateRenderer()) -> None:
+        super().__init__(renderer)
+        self._shortcuts: Dict[str, str] = {}
 
     async def proxy_shortcut(self, ack, body, client) -> None:
         await ack()
         shortcut_name = body["callback_id"]
         view = self._templates[shortcut_name]["spec"]["view"]
-        view["callback_id"] = shortcut_name
+        view["callback_id"] = self._shortcuts[shortcut_name]
         view = await self._renderer.render_object(view, {})
         await client.views_open(trigger_id=body["trigger_id"], view=view)
 
-    async def proxy_view(self, ack, body, view, say) -> None:
-        await ack()
-        callback_id = view["callback_id"]
-        form_data = SlackValuesParser.parse_values(view["state"]["values"])
-        await run_workflow(
-            tasks=self._templates[callback_id]["spec"]["steps"],
-            initial_data={
-                "view": view,
-                "body": body,
-                "values": form_data,
-            },
-        )
-
-    def update_template(self, template: Dict[str, Any]) -> None:
-        name = template["metadata"]["name"]
-        self._templates[name] = template
-
-    def register_template(self, template: Dict[str, Any]) -> None:
-        name = template["metadata"]["name"]
-        if name not in self._templates:
-            self._templates[name] = template
-
-            app.shortcut(name)(self.proxy_shortcut)
-            logger.info(f"Registerd handler for template: {name} with type: shortcut")
-
-            app.view(name)(self.proxy_view)
-        else:
-            logger.warning(f"Template {name} already exists. Updating.")
-            self.update_template(template)
+    def register_screens_handlers(
+        self, template_name: str, template: Dict[str, Any]
+    ) -> None:
+        if template_name not in self._shortcuts:
+            self._shortcuts[template_name] = (
+                f"{template_name}_{template["spec"]["view"]["callback_id"]}"
+            )
+            app.shortcut(template_name)(self.proxy_shortcut)
+            logger.info(
+                f"Registerd handler for template: {template_name} with type: shortcut"
+            )
 
 
 class EventHandler(AppHandler):
@@ -160,10 +171,11 @@ class EventHandler(AppHandler):
     ) -> None:
         super().__init__(renderer)
         self._event_type = event_type
+        self._patterns: Dict[str, Dict] = {}
         app.event(event_type)(self.proxy_event)
 
     def _find_template(self, text: str) -> Dict[str, Any] | None:
-        for pattern, template in self._templates.items():
+        for pattern, template in self._patterns.items():
             if re.match(pattern, text):
                 return template
 
@@ -177,28 +189,34 @@ class EventHandler(AppHandler):
         channel = event.get("channel")
         view = template["spec"]["view"]
         view = await self._renderer.render_object(view, {})
-        await say(blocks=view["blocks"])
+        await say(text="Test", blocks=view["blocks"])
 
-    def update_template(self, template: Dict[str, Any]) -> None:
+    def register_screens_handlers(
+        self, template_name: str, template: Dict[str, Any]
+    ) -> None:
         pattern = template["spec"]["pattern"]
-        self._templates[pattern] = template
-
-    def register_template(self, template: Dict[str, Any]) -> None:
-        name = template["metadata"]["name"]
-        pattern = template["spec"]["pattern"]
-        if pattern not in self._templates:
-            self._templates[pattern] = template
+        if pattern not in self._patterns:
+            self._patterns[pattern] = template
             logger.info(
-                f"Registerd handler for template: {name} with type: {self._event_type}"
+                f"Registerd handler for template: {template_name} with type: {self._event_type}"
             )
 
-        else:
-            logger.warning(f"Template {name} already exists. Updating.")
-            self.update_template(template)
-        for action in template["spec"].get("actions", []):
-            action_id = action["id"]
-            steps = action["steps"]
-            self.register_action(action_id, steps)
+    # def register_template(self, template: Dict[str, Any]) -> None:
+    #     name = template["metadata"]["name"]
+    #     pattern = template["spec"]["pattern"]
+    #     if pattern not in self._templates:
+    #         self._templates[pattern] = template
+    #         logger.info(
+    #             f"Registerd handler for template: {name} with type: {self._event_type}"
+    #         )
+
+    #     else:
+    #         logger.warning(f"Template {name} already exists. Updating.")
+    #         self.update_template(template)
+    #     for action in template["spec"].get("actions", []):
+    #         action_id = action["id"]
+    #         steps = action["steps"]
+    #         self.register_action(name, action_id, steps)
 
 
 class AppMentionHandler(EventHandler):
