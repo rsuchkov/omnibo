@@ -1,4 +1,5 @@
 import re
+import json
 import logging
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.aiohttp import AsyncSocketModeHandler
@@ -56,12 +57,148 @@ class SlackValuesParser:
         return parsed_data
 
 
+def modify_dict_values(data, keys_to_modify: set, prefix: str):
+    def recursive_modify(d):
+        if isinstance(d, dict):
+            for key, value in d.items():
+                if key in keys_to_modify and isinstance(value, str):
+                    d[key] = prefix + value
+                else:
+                    recursive_modify(value)
+        elif isinstance(d, list):
+            for item in d:
+                recursive_modify(item)
+
+    recursive_modify(data)
+    return data
+
+
+class ScreensOrchestrator:
+    def __init__(
+        self,
+        template_name: str,
+        form: Dict[str, Any],
+        renderer: TemplateRenderer = TemplateRenderer(),
+    ):
+        self._template_name = template_name
+        self._form = form
+        self._renderer = renderer
+
+    def _draw_progressbar_blocks(self, current_screen: int, total_screens: int) -> Dict:
+        finished = "🟩 " * current_screen
+        current = "⬜ " * (total_screens - current_screen)
+        return [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "Workflow Progress"},
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"{finished}{current}*(Step {current_screen} of {total_screens})*",
+                    }
+                ],
+            },
+        ]
+
+    async def render(
+        self, screen_index: int, context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        screen = self._form["screens"][screen_index]
+        blocks = (await self._renderer.render_object(screen, context))["blocks"]
+        if len(self._form["screens"]) > 1:
+            blocks = (
+                self._draw_progressbar_blocks(
+                    screen_index + 1, len(self._form["screens"])
+                )
+                + blocks
+            )
+        view = {
+            "type": "modal",
+            "callback_id": self._form["callback_id"],
+            "title": self._form["title"],
+            "blocks": blocks,
+            "close": {"type": "plain_text", "text": "Close"},
+            "submit": self._form["submit"],
+        }
+        if screen_index == len(self._form["screens"]) - 1:
+            view["submit"] = self._form["submit"]
+        else:
+            # save private metadata about the current screen
+            view["private_metadata"] = json.dumps(
+                {
+                    "current_screen": screen_index,
+                    "total_screens": len(self._form["screens"]),
+                    "template_name": self._template_name,
+                }
+            )
+            view["callback_id"] = f"next_step_modal"
+            view["submit"] = {"type": "plain_text", "text": "Next"}
+            # blocks.append(
+            #     {
+            #         "type": "actions",
+            #         "elements": [
+            #             {
+            #                 "type": "button",
+            #                 "text": {"type": "plain_text", "text": "Next"},
+            #                 "style": "primary",
+            #                 "action_id": "next_step_modal",
+            #             }
+            #         ],
+            #     }
+            # )
+        return view
+
+
+class ModalScreen:
+    def __init__(
+        self,
+        template_name: str,
+        screen: Dict,
+        renderer: TemplateRenderer = TemplateRenderer(),
+    ):
+        self._template_name = template_name
+        self._screen = modify_dict_values(
+            screen, {"action_id", "callback_id"}, self._template_name
+        )
+        self._renderer = renderer
+
+    async def render(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        return await self._renderer.render_object(self._screen, context)
+
+
+class MessageScreen:
+    def __init__(
+        self,
+        template_name: str,
+        screen: Dict,
+        renderer: TemplateRenderer = TemplateRenderer(),
+    ):
+        self._template_name = template_name
+        self._screen = modify_dict_values(
+            screen, {"action_id1", "callback_id1"}, self._template_name
+        )
+        self._renderer = renderer
+
+    async def render(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        return await self._renderer.render_object(self._screen, context)
+
+
 class AppHandler:
     def __init__(self, renderer: TemplateRenderer = TemplateRenderer()) -> None:
         self._templates: Dict[str, Dict] = {}
         self._views_submissions: Dict[str, List[Dict]] = {}
         self._actions: Dict[str, List[Dict]] = {}
         self._renderer = renderer
+        self._forms: Dict[str, ScreensOrchestrator] = {}
+
+        # register common handlers
+        app.view("next_step_modal")(self.next_step_modal)
+
+    async def run_workflow(self, template_name: str) -> None:
+        pass
 
     async def proxy_view_submission(
         self,
@@ -88,15 +225,38 @@ class AppHandler:
         values = body["state"]["values"]
         action_id = body["actions"][0]["action_id"]
 
+    @app.action("next_step")
+    async def next_step(self, ack: Callable, body: Dict[str, Any], client) -> None:
+        await ack()
+
+    # @app.view("next_step_modal")
+    async def next_step_modal(
+        self,
+        ack: Callable,
+        body: Dict[str, Any],
+        client: Any,
+        view: Dict[str, Any],
+    ) -> None:
+        await ack()
+        private_metadata = json.loads(view["private_metadata"])
+        template_name = private_metadata["template_name"]
+        current_screen = private_metadata["current_screen"]
+        total_screens = private_metadata["total_screens"]
+        logger.info(f"Private metadata: {private_metadata}")
+        workflow_form = self._forms.get(template_name)
+        view = await workflow_form.render(current_screen + 1, {})
+        # view = await self._renderer.render_object(view, {})
+        await client.views_open(trigger_id=body["trigger_id"], view=view)
+
     def register_view_submission(
         self, template_name: str, callback_id: str, steps: List[Dict]
     ) -> None:
-        modified_callback_id = f"{template_name}_{callback_id}"
-        if modified_callback_id not in self._views_submissions:
-            app.view(modified_callback_id)(self.proxy_view_submission)
+
+        if callback_id not in self._views_submissions:
+            app.view(callback_id)(self.proxy_view_submission)
         else:
             logger.warning(f"Callback ID {callback_id} already exists. Overwriting.")
-        self._views_submissions[modified_callback_id] = steps
+        self._views_submissions[callback_id] = steps
 
     def register_action(
         self, template_name: str, action_id: str, steps: List[Dict]
@@ -109,9 +269,16 @@ class AppHandler:
             logger.warning(f"Action ID {action_id} already exists. Overwriting")
         self._actions[modified_action_id] = steps
 
+    def register_screens(self, template_name: str, template: Dict[str, Any]) -> None:
+        workflow_form = template["spec"].get("form")
+        if workflow_form is None:
+            return
+        self._forms[template_name] = ScreensOrchestrator(template_name, workflow_form)
+
     def register_workflow_handlers(
         self, template_name: str, template: Dict[str, Any]
     ) -> None:
+
         # Registering actions described in the template
         for action in template["spec"].get("actions", []):
             action_id = action["id"]
@@ -135,6 +302,9 @@ class AppHandler:
         template_name = template["metadata"]["name"]
         self._templates[template_name] = template
 
+        # Registering screens described in the template
+        self.register_screens(template_name, template)
+
         self.register_workflow_handlers(template_name, template)
         self.register_screens_handlers(template_name, template)
 
@@ -144,22 +314,29 @@ class ShortcutHandler(AppHandler):
         super().__init__(renderer)
         self._shortcuts: Dict[str, str] = {}
 
-    async def proxy_shortcut(self, ack, body, client) -> None:
+    async def proxy_shortcut(self, ack, body, client, template: str) -> None:
         await ack()
-        shortcut_name = body["callback_id"]
-        view = self._templates[shortcut_name]["spec"]["view"]
-        view["callback_id"] = self._shortcuts[shortcut_name]
-        view = await self._renderer.render_object(view, {})
+        # shortcut_name = body["callback_id"]
+        # view = self._templates[shortcut_name]["spec"]["view"]
+        # view["callback_id"] = self._shortcuts[shortcut_name]
+        workflow_form = self._forms.get(template)
+        view = await workflow_form.render(0, {})
+        # view = await self._renderer.render_object(view, {})
         await client.views_open(trigger_id=body["trigger_id"], view=view)
 
     def register_screens_handlers(
         self, template_name: str, template: Dict[str, Any]
     ) -> None:
         if template_name not in self._shortcuts:
-            self._shortcuts[template_name] = (
-                f"{template_name}_{template["spec"]["view"]["callback_id"]}"
-            )
-            app.shortcut(template_name)(self.proxy_shortcut)
+            # self._shortcuts[template_name] = (
+            #     f"{template_name}_{template["spec"]["view"]["callback_id"]}"
+            # )
+            self._shortcuts[template_name] = 1
+
+            async def callback(ack, body, client):
+                return await self.proxy_shortcut(ack, body, client, template_name)
+
+            app.shortcut(template_name)(callback)
             logger.info(
                 f"Registerd handler for template: {template_name} with type: shortcut"
             )
@@ -200,23 +377,6 @@ class EventHandler(AppHandler):
             logger.info(
                 f"Registerd handler for template: {template_name} with type: {self._event_type}"
             )
-
-    # def register_template(self, template: Dict[str, Any]) -> None:
-    #     name = template["metadata"]["name"]
-    #     pattern = template["spec"]["pattern"]
-    #     if pattern not in self._templates:
-    #         self._templates[pattern] = template
-    #         logger.info(
-    #             f"Registerd handler for template: {name} with type: {self._event_type}"
-    #         )
-
-    #     else:
-    #         logger.warning(f"Template {name} already exists. Updating.")
-    #         self.update_template(template)
-    #     for action in template["spec"].get("actions", []):
-    #         action_id = action["id"]
-    #         steps = action["steps"]
-    #         self.register_action(name, action_id, steps)
 
 
 class AppMentionHandler(EventHandler):
